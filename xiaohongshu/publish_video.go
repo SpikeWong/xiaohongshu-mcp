@@ -4,11 +4,9 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/proto"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -21,6 +19,7 @@ type PublishVideoContent struct {
 	VideoPath    string
 	ScheduleTime *time.Time // 定时发布时间，nil 表示立即发布
 	Visibility   string     // 可见范围: "公开可见"(默认), "仅自己可见", "仅互关好友可见"
+	Products     []string   // 商品关键词列表，用于绑定带货商品
 }
 
 // NewPublishVideoAction 进入发布页并切换到"上传视频"
@@ -63,7 +62,7 @@ func (p *PublishAction) PublishVideo(ctx context.Context, content PublishVideoCo
 		return errors.Wrap(err, "小红书上传视频失败")
 	}
 
-	if err := submitPublishVideo(page, content.Title, content.Content, content.Tags, content.ScheduleTime, content.Visibility); err != nil {
+	if err := submitPublishVideo(page, content.Title, content.Content, content.Tags, content.ScheduleTime, content.Visibility, content.Products); err != nil {
 		return errors.Wrap(err, "小红书发布失败")
 	}
 	return nil
@@ -91,7 +90,7 @@ func uploadVideo(page *rod.Page, videoPath string) error {
 	fileInput.MustSetFiles(videoPath)
 
 	// 对于视频，等待发布按钮变为可点击即表示处理完成
-	btn, err := waitForPublishButtonClickable(pp)
+	btn, err := waitForPublishButtonClickable(pp, 10*time.Minute)
 	if err != nil {
 		return err
 	}
@@ -99,39 +98,8 @@ func uploadVideo(page *rod.Page, videoPath string) error {
 	return nil
 }
 
-// waitForPublishButtonClickable 等待发布按钮可点击
-func waitForPublishButtonClickable(page *rod.Page) (*rod.Element, error) {
-	maxWait := 10 * time.Minute
-	interval := 1 * time.Second
-	start := time.Now()
-	selector := ".publish-page-publish-btn button.bg-red"
-
-	slog.Info("开始等待发布按钮可点击(视频)")
-
-	for time.Since(start) < maxWait {
-		btn, err := page.Element(selector)
-		if err == nil && btn != nil {
-			// 可见性
-			vis, verr := btn.Visible()
-			if verr == nil && vis {
-				// 检查 disabled 属性
-				if disabled, _ := btn.Attribute("disabled"); disabled == nil {
-					// 再通过 class 名粗略判断不在禁用态
-					if cls, _ := btn.Attribute("class"); cls != nil && !strings.Contains(*cls, "disabled") {
-						return btn, nil
-					}
-					// 即使 class 包含 disabled，只要没有 disabled 属性，也尝试点击一次以确认
-					return btn, nil
-				}
-			}
-		}
-		time.Sleep(interval)
-	}
-	return nil, errors.New("等待发布按钮可点击超时")
-}
-
 // submitPublishVideo 填写标题、正文、标签并点击发布（等待按钮可点击后再提交）
-func submitPublishVideo(page *rod.Page, title, content string, tags []string, scheduleTime *time.Time, visibility string) error {
+func submitPublishVideo(page *rod.Page, title, content string, tags []string, scheduleTime *time.Time, visibility string, products []string) error {
 	// 标题
 	titleElem, err := page.Element("div.d-input input")
 	if err != nil {
@@ -149,6 +117,9 @@ func submitPublishVideo(page *rod.Page, title, content string, tags []string, sc
 	}
 	if err := contentElem.Input(content); err != nil {
 		return errors.Wrap(err, "输入正文失败")
+	}
+	if err := waitAndClickTitleInput(titleElem); err != nil {
+		return err
 	}
 	if err := inputTags(contentElem, tags); err != nil {
 		return err
@@ -169,15 +140,13 @@ func submitPublishVideo(page *rod.Page, title, content string, tags []string, sc
 		return errors.Wrap(err, "设置可见范围失败")
 	}
 
-	// 等待发布按钮可点击
-	btn, err := waitForPublishButtonClickable(page)
-	if err != nil {
-		return err
+	// 绑定商品
+	if err := bindProducts(page, products); err != nil {
+		return errors.Wrap(err, "绑定商品失败")
 	}
 
-	// 点击发布
-	if err := btn.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return errors.Wrap(err, "点击发布按钮失败")
+	if err := clickPublishButton(page); err != nil {
+		return err
 	}
 
 	time.Sleep(3 * time.Second)
